@@ -1,0 +1,35 @@
+﻿# Environment variables and secrets - NEVER commit
+.env
+*.env
+.env.local
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ipynb_checkpoints/
+venv/
+.venv/
+env/
+
+# Data files - too large for git, generated locally
+data/raw/
+data/processed/
+*.faiss
+*.index
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Jupyter
+*.ipynb_checkpoints
