@@ -64,7 +64,10 @@ ANSWER:"""
 
 def generate_answer(question, retrieved_chunks):
     """Call the LLM with the retrieved context and return the answer text."""
-    model = genai.GenerativeModel(MODEL_NAME)
+    model = genai.GenerativeModel(
+        MODEL_NAME,
+        generation_config=genai.types.GenerationConfig(temperature=0.0),
+    )
     prompt = build_prompt(question, retrieved_chunks)
     response = model.generate_content(prompt)
     return response.text.strip()
