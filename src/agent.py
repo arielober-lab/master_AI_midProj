@@ -1,14 +1,18 @@
 """
 src/agent.py - The agentic version of the Forever Living Q&A system.
 
-Defines four tools and an agent loop that lets Gemini 2.5-flash decide which
+Defines five tools and an agent loop that lets Gemini 2.5-flash decide which
 of them to call, in what order, until it can answer the user's question.
 
 Tools:
-  - identify_product_from_image()                              uses CLIP
+  - identify_product_from_image()                              CLIP or Gemini Vision
   - retrieve_product_info(query, product=None)                 INCIDecoder corpus
   - search_pubmed(query)                                       PubMed corpus
   - compare_products(product_a, product_b, aspect)             wraps retrieve x2
+  - get_product_description(product)                           curated descriptions
+  - find_similar_product(product_description)                  closest Forever match
+
+The image identifier is switchable via the USE_VISION flag below.
 
 The agent loop is a generator that yields trajectory events as they happen,
 so the Streamlit UI can stream them and show the agent's reasoning live:
@@ -34,14 +38,25 @@ from dotenv import load_dotenv
 # Make the rest of src/ importable
 sys.path.insert(0, str(Path(__file__).parent))
 
-from identify_product import ProductIdentifier   # noqa: E402
-from retrieve import Retriever                   # noqa: E402
+from identify_product import ProductIdentifier              # noqa: E402
+from identify_product_vision import VisionProductIdentifier  # noqa: E402
+from find_similar_product import SimilarProductFinder        # noqa: E402
+from retrieve import Retriever                              # noqa: E402
 
 # ============================================================
 # Config
 # ============================================================
-MODEL_NAME        = "gemini-2.5-flash"
-MAX_TURNS_DEFAULT = 5
+# Which image identifier to use:
+#   True  -> Gemini Vision (reads the label text; distinguishes look-alike
+#            products like Bee Propolis vs Bee Pollen; needs no reference images)
+#   False -> CLIP (free, offline, but matches on overall appearance only)
+USE_VISION                = True
+
+MODEL_NAME                = "gemini-2.5-flash"
+MAX_TURNS_DEFAULT         = 5
+PRODUCT_DESCRIPTIONS_PATH = (
+    Path(__file__).parent.parent / "data" / "raw" / "product_descriptions.json"
+)
 
 load_dotenv()
 _api_key = os.environ.get("GEMINI_API_KEY")
@@ -51,6 +66,22 @@ if not _api_key:
         "    GEMINI_API_KEY=your-key-here"
     )
 genai.configure(api_key=_api_key)
+
+
+# ============================================================
+# Static data loaded at import time
+# ============================================================
+def _load_product_descriptions():
+    """Load the curated product descriptions from disk (or return empty dict)."""
+    if not PRODUCT_DESCRIPTIONS_PATH.exists():
+        return {}
+    with PRODUCT_DESCRIPTIONS_PATH.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    # Drop comment keys (any key starting with "_")
+    return {k: v for k, v in data.items() if not k.startswith("_")}
+
+
+_PRODUCT_DESCRIPTIONS = _load_product_descriptions()
 
 
 # ============================================================
@@ -70,7 +101,7 @@ def _set_context(identifier, retriever, image_path):
 
 
 # ============================================================
-# Helpers (shared with streamlit_app.py logic)
+# Helpers
 # ============================================================
 def _chunk_matches_product(chunk, target_product):
     """Match a chunk to a folder-style product slug."""
@@ -107,12 +138,12 @@ def _shrink_chunk(chunk_record):
     return {
         "product":  chunk["metadata"].get("product_name", "Unknown"),
         "chunk_id": chunk["chunk_id"],
-        "text":     chunk["text"][:500],   # cap to keep prompts compact
+        "text":     chunk["text"][:500],
     }
 
 
 # ============================================================
-# THE FOUR TOOLS
+# THE FIVE TOOLS
 # ============================================================
 def identify_product_from_image() -> Dict:
     """Identify the Forever Living product in the photo the user uploaded.
@@ -129,26 +160,35 @@ def identify_product_from_image() -> Dict:
     img_path = _context["image_path"]
     if not img_path:
         return {"error": "No image was uploaded by the user. Cannot identify."}
-
     identifier = _context["identifier"]
     if identifier is None:
         return {"error": "Identifier not initialized."}
-
     result = identifier.identify(img_path)
-    return {
-        "product":      result["product"],
-        "confidence":   result["confidence"],
-        "is_confident": result["is_confident"],
-        "alternatives": [m["product"] for m in result["top_matches"][:3]],
+
+    # Normalize across the two identifier backends:
+    #   CLIP    -> result has 'top_matches' (list of {product, score, ...})
+    #   Vision  -> result has 'reasoning'   (a sentence explaining the choice)
+    out = {
+        "product":      result.get("product"),
+        "confidence":   result.get("confidence"),
+        "is_confident": result.get("is_confident"),
     }
+    if "top_matches" in result:
+        out["alternatives"] = [m["product"] for m in result["top_matches"][:3]]
+    if "reasoning" in result:
+        out["reasoning"] = result["reasoning"]
+    return out
 
 
 def retrieve_product_info(query: str, product: Optional[str] = None) -> List[Dict]:
-    """Search the INCIDecoder ingredient knowledge base for product info.
+    """Search the INCIDecoder ingredient knowledge base for product information.
 
     Use this for any factual question about a Forever Living product's
-    ingredients, their cosmetic functions (moisturizer, preservative, etc.),
-    or the product's overall composition.
+    INGREDIENTS, their cosmetic functions (moisturizer, preservative, etc.),
+    or the product's chemical composition.
+
+    Do NOT use this for general "what is this product for" questions about
+    use case or application - use get_product_description for those.
 
     Args:
         query:   What information to search for, in natural language.
@@ -161,7 +201,6 @@ def retrieve_product_info(query: str, product: Optional[str] = None) -> List[Dic
     retriever = _context["retriever"]
     if retriever is None:
         return [{"error": "Retriever not initialized."}]
-
     raw = retriever.retrieve(query, top_k=20)
     filtered = [
         r for r in raw
@@ -169,7 +208,6 @@ def retrieve_product_info(query: str, product: Optional[str] = None) -> List[Dic
     ]
     if product:
         filtered = [r for r in filtered if _chunk_matches_product(r["chunk"], product)]
-
     return [_shrink_chunk(r) for r in filtered[:5]]
 
 
@@ -189,7 +227,6 @@ def search_pubmed(query: str) -> List[Dict]:
     retriever = _context["retriever"]
     if retriever is None:
         return [{"error": "Retriever not initialized."}]
-
     raw = retriever.retrieve(query, top_k=20)
     filtered = [r for r in raw if r["chunk"]["metadata"].get("source") == "pubmed"]
     return [_shrink_chunk(r) for r in filtered[:5]]
@@ -215,12 +252,71 @@ def compare_products(product_a: str, product_b: str, aspect: str) -> Dict:
     }
 
 
+def get_product_description(product: str) -> Dict:
+    """Get the curated general description of a Forever Living product.
+
+    Use this for natural product-level questions like:
+      - "What is this product for?"
+      - "How do I use it?"
+      - "What is Aloe Sunscreen used for?"
+      - "Tell me about this product."
+
+    Do NOT use this for ingredient-level questions - use retrieve_product_info
+    for those.
+
+    Args:
+        product: Product slug (e.g. 'forever-living-aloe-sunscreen').
+
+    Returns:
+        A dict with the description, or an error if not found.
+    """
+    desc = _PRODUCT_DESCRIPTIONS.get(product)
+    if desc is None:
+        return {
+            "error": (
+                f"No curated description for '{product}'. "
+                f"Try retrieve_product_info instead, or check that the product "
+                f"slug is correct."
+            )
+        }
+    return {"product": product, "description": desc}
+
+
+# Lazily-created SimilarProductFinder (built on first use to avoid loading it
+# when the agent never needs it).
+_similar_finder = None
+
+
+def find_similar_product(product_description: str) -> Dict:
+    """Recommend the closest Forever Living product to a NON-Forever product.
+
+    Use this when the user shows or describes a product that is NOT in the
+    Forever catalog (identify_product_from_image returned null / not confident),
+    and asks what similar product Forever offers.
+
+    Args:
+        product_description: A description of the non-Forever product - what it
+            is and what it is for (e.g. "a moisturizing face cream for dry skin",
+            or whatever the image identification read off the label).
+
+    Returns:
+        A dict with 'recommended_product' (slug or None), 'match_quality'
+        (close/partial/none), and 'reasoning'.
+    """
+    global _similar_finder
+    if _similar_finder is None:
+        _similar_finder = SimilarProductFinder()
+    return _similar_finder.find(product_description)
+
+
 # Registry mapping tool names -> Python callables
 TOOL_FUNCS = {
     "identify_product_from_image": identify_product_from_image,
     "retrieve_product_info":       retrieve_product_info,
     "search_pubmed":               search_pubmed,
     "compare_products":            compare_products,
+    "get_product_description":     get_product_description,
+    "find_similar_product":        find_similar_product,
 }
 
 
@@ -241,24 +337,42 @@ def _build_system_prompt(known_products, has_image: bool):
     )
     return f"""You are an agentic Q&A assistant for Forever Living aloe-based topical products.
 
-You have four tools available. Use them to answer the user's question. Use ONLY
+You have five tools available. Use them to answer the user's question. Use ONLY
 the information returned by your tools - never rely on your own knowledge for
 factual claims about products, ingredients, or research.
 
-Decision rules:
-- For questions about a product's ingredients or what they do: use retrieve_product_info.
-- For questions about safety, side effects, or scientific research: use search_pubmed.
-- For comparisons between two products: use compare_products.
-- For identifying a product from a photo: use identify_product_from_image (only when relevant).
-- You may call multiple tools in sequence, building on previous results.
-- When you have enough information, write the final answer and stop calling tools.
+Decision rules — pick the right tool for each kind of question:
+
+  - PRODUCT-LEVEL questions ("What is this product for?", "How do I use it?",
+    "Tell me about Aloe Lips") -> get_product_description.
+
+  - INGREDIENT-LEVEL questions ("What does Octocrylene do?", "What ingredients
+    are in X?", "Which ingredients act as moisturizers?") -> retrieve_product_info.
+
+  - SAFETY / RESEARCH questions ("Is X safe during pregnancy?", "Is there
+    research on aloe vera and wound healing?") -> search_pubmed.
+
+  - COMPARISON questions ("Compare A and B on Z") -> compare_products.
+
+  - IDENTIFY-FROM-PHOTO -> identify_product_from_image (only when the user
+    uploaded a photo and the question references that product).
+
+  - SIMILAR-PRODUCT REQUESTS: if the user shows or describes a product that is
+    NOT a Forever Living product (for example, identify_product_from_image
+    returned null / not confident) and asks what similar product Forever has,
+    use find_similar_product with a short description of what the product is.
+
+You may call multiple tools in sequence, building on previous results. When you
+have enough information, write the final answer and stop calling tools.
 
 Final answer rules (same as the base RAG, applied to the synthesis you write):
-- Cite sources in square brackets, e.g. [Aloe Sunscreen] for product info,
-  or [PubMed: article title] for research.
-- Do NOT make medical or therapeutic claims (curing, treating, healing diseases).
-- Do NOT use comparative superlatives (best, strongest, most effective).
-- If your tools do not contain the answer, say so explicitly.
+  - Cite sources in square brackets:
+      [Aloe Sunscreen]                     for retrieve_product_info results
+      [PubMed: <article title>]            for search_pubmed results
+      [Description: Aloe Sunscreen]        for get_product_description results
+  - Do NOT make medical or therapeutic claims (curing, treating, healing diseases).
+  - Do NOT use comparative superlatives (best, strongest, most effective).
+  - If your tools do not contain the answer, say so explicitly.
 
 Image context: {image_note}
 
@@ -288,24 +402,24 @@ def run_agent(
         max_turns:    Safety cap on tool-call iterations.
 
     Yields:
-        Trajectory events (see module docstring for the shape).
+        Trajectory events (see module docstring).
     """
-    # Lazy-load models if Streamlit didn't pre-load them
     if identifier is None:
-        identifier = ProductIdentifier()
+        identifier = VisionProductIdentifier() if USE_VISION else ProductIdentifier()
     if retriever is None:
         retriever = Retriever()
 
-    # Set per-request context that the module-level tool functions read
     _set_context(identifier, retriever, image_path)
 
-    # Build system instruction
-    known_products = sorted(set(L["product"] for L in identifier.labels))
-    system_prompt = _build_system_prompt(known_products, has_image=image_path is not None)
+    # Derive the known-product list in a way that works for both backends:
+    #   CLIP   has .labels (list of {product, ...})
+    #   Vision has .known_products (list of slugs)
+    if hasattr(identifier, "labels"):
+        known_products = sorted(set(L["product"] for L in identifier.labels))
+    else:
+        known_products = sorted(set(identifier.known_products))
+    system_prompt  = _build_system_prompt(known_products, has_image=image_path is not None)
 
-    # Set up the Gemini model with our Python tools
-    # Passing functions directly lets google-generativeai auto-generate the schemas
-    # from the type hints and docstrings.
     model = genai.GenerativeModel(
         model_name=MODEL_NAME,
         tools=list(TOOL_FUNCS.values()),
@@ -313,15 +427,11 @@ def run_agent(
         generation_config=genai.types.GenerationConfig(temperature=0.0),
     )
     chat = model.start_chat(enable_automatic_function_calling=False)
-
-    # Send the first user message
     response = chat.send_message(user_message)
 
-    # Track recent (tool, args) pairs to detect repetition
     recent_calls: List[str] = []
 
     for turn in range(1, max_turns + 1):
-        # Look for a function_call in the model's response parts
         fn_call = None
         for part in response.parts:
             if getattr(part, "function_call", None) and part.function_call.name:
@@ -329,15 +439,12 @@ def run_agent(
                 break
 
         if fn_call is None:
-            # No tool call - the model has produced a final answer
             text = (response.text or "").strip() or "(model returned empty answer)"
             yield {"type": "final", "answer": text}
             return
 
-        # Convert protobuf args to a plain dict
         args = {k: v for k, v in fn_call.args.items()} if fn_call.args else {}
 
-        # Repetition guard: same tool+args twice in a row is a sign of being stuck
         call_signature = f"{fn_call.name}({json.dumps(args, sort_keys=True, default=str)})"
         if recent_calls and recent_calls[-1] == call_signature:
             yield {
@@ -350,10 +457,8 @@ def run_agent(
             return
         recent_calls.append(call_signature)
 
-        # Emit the tool_call event
         yield {"type": "tool_call", "turn": turn, "name": fn_call.name, "args": args}
 
-        # Execute the tool, catching any unexpected exception so the app never crashes
         tool_func = TOOL_FUNCS.get(fn_call.name)
         if tool_func is None:
             result = {"error": f"Unknown tool: {fn_call.name}"}
@@ -365,10 +470,8 @@ def run_agent(
             except Exception as e:
                 result = {"error": f"Tool '{fn_call.name}' raised: {e}"}
 
-        # Emit the tool_result event
         yield {"type": "tool_result", "turn": turn, "result": result}
 
-        # Send the tool result back to the model so it can decide the next step
         response = chat.send_message(
             genai.protos.Content(
                 parts=[genai.protos.Part(
@@ -380,7 +483,6 @@ def run_agent(
             )
         )
 
-    # If we exit the for-loop, we hit max_turns without a final answer
     yield {
         "type": "error",
         "message": (
@@ -392,21 +494,18 @@ def run_agent(
 
 
 # ============================================================
-# CLI testing (run a single question, print the trajectory)
+# CLI testing
 # ============================================================
 def _main():
     if len(sys.argv) < 2:
         print('Usage: python src/agent.py "your question here" [path/to/image.jpg]')
         sys.exit(1)
-
-    question  = sys.argv[1]
+    question   = sys.argv[1]
     image_path = sys.argv[2] if len(sys.argv) >= 3 else None
-
     print(f"\n🧑  {question}")
     if image_path:
         print(f"📷  (image: {image_path})")
     print("─" * 70)
-
     for event in run_agent(question, image_path=image_path):
         etype = event["type"]
         if etype == "tool_call":

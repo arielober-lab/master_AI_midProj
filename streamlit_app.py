@@ -293,7 +293,9 @@ else:
         for event in run_agent(
             agent_question,
             image_path=image_path,
-            identifier=identifier,
+            # Note: we deliberately do NOT pass identifier here. run_agent picks
+            # the right backend based on the USE_VISION flag in agent.py
+            # (Vision for the agent; Simple mode above keeps using CLIP).
             retriever=retriever,
         ):
             etype = event["type"]
