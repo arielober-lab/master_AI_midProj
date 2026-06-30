@@ -161,7 +161,7 @@ if mode == "Simple mode (direct RAG)":
 
     if uploaded is not None:
         img = Image.open(uploaded).convert("RGB")
-        st.image(img, caption="Your photo", use_container_width=True)
+        st.image(img, caption="Your photo", width=240)
 
         with st.spinner("Identifying product..."):
             identification_result = identifier.identify(img)
@@ -260,7 +260,7 @@ else:
     )
     if agent_image is not None:
         st.image(Image.open(agent_image), caption="Your photo",
-                 use_container_width=True)
+                 width=320)
 
     # The question
     st.subheader("Your question")
